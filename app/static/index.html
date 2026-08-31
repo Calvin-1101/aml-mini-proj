@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AML transaction score</title>
+  <style>
+    :root { font-family: system-ui, sans-serif; color: #1a1a1a; background: #f4f1ea; }
+    body { max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.4rem; }
+    p.lead { color: #444; line-height: 1.45; }
+    form { display: grid; gap: 0.9rem; background: #fff; padding: 1.25rem; border-radius: 10px; }
+    label { display: grid; gap: 0.25rem; font-weight: 600; font-size: 0.92rem; }
+    .hint { font-weight: 400; font-size: 0.8rem; color: #666; }
+    input, select { padding: 0.45rem 0.5rem; font: inherit; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
+    button { padding: 0.7rem 1rem; font: inherit; font-weight: 650; cursor: pointer; }
+    #out { margin-top: 1rem; padding: 1rem; border-radius: 8px; background: #fff; white-space: pre-wrap; }
+    #out.flag { background: #fde8e8; }
+    #out.ok { background: #e8f5e9; }
+    @media (max-width: 600px) { .row { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <h1>AML transaction scorer</h1>
+  <p class="lead">
+    Enter features the model was trained on (not a raw bank message).
+    Velocity fields are “how much this receiver already saw in the last 1h / 24h, including this txn.”
+  </p>
+
+  <form id="form">
+    <div class="row">
+      <label>Amount received
+        <span class="hint">What the receiver’s account is credited. Same units as training (original currency amount).</span>
+        <input name="Amount Received" type="number" step="any" min="0" required value="1000" />
+      </label>
+      <label>Amount paid
+        <span class="hint">What the sender paid. Often equal to amount received unless FX / fees.</span>
+        <input name="Amount Paid" type="number" step="any" min="0" required value="1000" />
+      </label>
+    </div>
+
+    <div class="row">
+      <label>Hour (0–23)
+        <span class="hint">Hour of the timestamp in 24h clock. 0 = midnight, 23 = 11pm.</span>
+        <input name="Hour" type="number" min="0" max="23" required value="14" />
+      </label>
+      <label>Day of week (0–6)
+        <span class="hint">Pandas weekday: 0 = Monday … 6 = Sunday.</span>
+        <select name="Day of week" required>
+          <option value="0">0 — Monday</option>
+          <option value="1">1 — Tuesday</option>
+          <option value="2">2 — Wednesday</option>
+          <option value="3">3 — Thursday</option>
+          <option value="4">4 — Friday</option>
+          <option value="5">5 — Saturday</option>
+          <option value="6">6 — Sunday</option>
+        </select>
+      </label>
+    </div>
+
+    <div class="row">
+      <label>Receiving currency
+        <span class="hint">Currency of Amount received. Must be a label the model saw in training.</span>
+        <select name="Receiving Currency" id="recv_ccy" required></select>
+      </label>
+      <label>Payment currency
+        <span class="hint">Currency of Amount paid. If this differs from receiving, it is a cross-currency txn.</span>
+        <select name="Payment Currency" id="pay_ccy" required></select>
+      </label>
+    </div>
+
+    <label>Payment format
+      <span class="hint">Rail used: ACH (US bank transfer), wire, cash, cheque, card, crypto, reinvestment.</span>
+      <select name="Payment Format" required>
+        <option>ACH</option>
+        <option>Cheque</option>
+        <option>Credit Card</option>
+        <option>Cash</option>
+        <option>Wire</option>
+        <option>Bitcoin</option>
+        <option>Reinvestment</option>
+      </select>
+    </label>
+
+    <div class="row">
+      <label>Cross currency (0 or 1)
+        <span class="hint">1 if receiving currency ≠ payment currency. Updated automatically from the two dropdowns; you can override.</span>
+        <input name="Cross currency check" id="cross_ccy" type="number" min="0" max="1" required value="0" />
+      </label>
+      <label>Cross bank (0 or 1)
+        <span class="hint">1 if From Bank ≠ To Bank (money left the sending institution).</span>
+        <input name="Cross bank check" type="number" min="0" max="1" required value="1" />
+      </label>
+    </div>
+
+    <div class="row">
+      <label>Receiver txn count, last 1 hour
+        <span class="hint">How many inbound txns this receiver had in the trailing 1h, including this one. Minimum 1 (this txn).</span>
+        <input name="received_count_1h" type="number" min="1" step="1" required value="1" />
+      </label>
+      <label>Receiver volume, last 1 hour
+        <span class="hint">Sum of Amount received on those 1h inbound txns, including this one.</span>
+        <input name="received_amt_1h" type="number" step="any" min="0" required value="1000" />
+      </label>
+    </div>
+
+    <div class="row">
+      <label>Receiver txn count, last 24 hours
+        <span class="hint">Same idea, 24h window. Must be ≥ the 1h count.</span>
+        <input name="received_count_24h" type="number" min="1" step="1" required value="1" />
+      </label>
+      <label>Receiver volume, last 24 hours
+        <span class="hint">Sum of Amount received in the trailing 24h, including this txn.</span>
+        <input name="received_amt_24h" type="number" step="any" min="0" required value="1000" />
+      </label>
+    </div>
+
+    <label>Alert threshold (0–1)
+      <span class="hint">Flag if p(laundering) ≥ this. 0.5 is a placeholder, not a tuned AML cutoff.</span>
+      <input name="threshold" type="number" min="0" max="1" step="0.01" value="0.5" />
+    </label>
+
+    <button type="submit">Generate prediction</button>
+  </form>
+
+  <div id="out">No score yet.</div>
+
+  <script>
+    const currencies = [
+      "US Dollar", "Euro", "Yuan", "Yen", "UK Pound", "Canada Dollar",
+      "Australian Dollar", "Swiss Franc", "Ruble", "Rupee", "Bitcoin",
+      "Mexican Peso", "Saudi Riyal", "Shekel", "Brazil Real",
+    ];
+    const recv = document.getElementById("recv_ccy");
+    const pay = document.getElementById("pay_ccy");
+    currencies.forEach((c) => {
+      recv.add(new Option(c, c));
+      pay.add(new Option(c, c));
+    });
+    recv.value = "US Dollar";
+    pay.value = "US Dollar";
+
+    function syncCrossCcy() {
+      document.getElementById("cross_ccy").value = recv.value === pay.value ? 0 : 1;
+    }
+    recv.addEventListener("change", syncCrossCcy);
+    pay.addEventListener("change", syncCrossCcy);
+
+    document.getElementById("form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      const threshold = fd.get("threshold");
+      fd.delete("threshold");
+      const body = Object.fromEntries(fd.entries());
+      for (const k of [
+        "Amount Received", "Amount Paid", "Hour", "Day of week",
+        "Cross currency check", "Cross bank check",
+        "received_count_1h", "received_amt_1h",
+        "received_count_24h", "received_amt_24h",
+      ]) body[k] = Number(body[k]);
+
+      const out = document.getElementById("out");
+      out.className = "";
+      out.textContent = "Scoring…";
+      try {
+        const res = await fetch("/predict?threshold=" + encodeURIComponent(threshold), {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify(body),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          out.textContent = "Error " + res.status + "\n" + JSON.stringify(data, null, 2);
+          return;
+        }
+        const pct = (data.p_laundering * 100).toFixed(2);
+        out.className = data.flag ? "flag" : "ok";
+        out.textContent =
+          (data.flag ? "FLAGGED as possible laundering\n" : "Below threshold\n") +
+          "p(laundering) = " + pct + "%\n" +
+          "threshold = " + data.threshold;
+      } catch (err) {
+        out.textContent = String(err);
+      }
+    });
+  </script>
+</body>
+</html>
